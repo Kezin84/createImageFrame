@@ -57,6 +57,7 @@ const textItems = ref<TextItem[]>([]);
 const selectedTextId = ref<string | null>(null);
 const activeTool = ref<string | null>(null);
 const isDownloading = ref(false);
+const upscaleExport = ref(true);
 
 const container = ref<HTMLElement | null>(null);
 const previewCanvas = ref<HTMLCanvasElement | null>(null);
@@ -325,19 +326,24 @@ async function renderBlob(photo: PhotoItem): Promise<Blob | null> {
   const objH = isRotated ? sw : sh;
   const ratio = objW / objH;
   
-  let tw = 1080, th = 1080;
-  if (ratio > 1.05) { tw = 1200; th = 630; }
-  else if (ratio < 0.95) { tw = 1080; th = 1350; }
+  const scaleExport = upscaleExport.value ? 2 : 1;
+  let tw = 1080 * scaleExport, th = 1080 * scaleExport;
+  if (ratio > 1.05) { tw = 1200 * scaleExport; th = 630 * scaleExport; }
+  else if (ratio < 0.95) { tw = 1080 * scaleExport; th = 1350 * scaleExport; }
   
   // Tùy chỉnh nếu không có ảnh sản phẩm nhưng lại có khung (cũng đã chặn trên)
   if (!img && frameImage.value) {
-    tw = frameImage.value.width;
-    th = frameImage.value.height;
+    tw = frameImage.value.width * scaleExport;
+    th = frameImage.value.height * scaleExport;
   }
 
   const c = document.createElement('canvas'); c.width = tw; c.height = th;
   const ctx = c.getContext('2d'); if (!ctx) return null;
   ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+  
+  if (upscaleExport.value) {
+    ctx.filter = 'contrast(102%) saturate(105%)'; // Làm nét và nổi bật màu sắc nhẹ
+  }
   
   ctx.save();
   ctx.translate(tw / 2, th / 2);
@@ -349,6 +355,9 @@ async function renderBlob(photo: PhotoItem): Promise<Blob | null> {
   }
   drawImageCover(ctx, img, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
   ctx.restore();
+
+  // Reset filter for frame and texts (so we don't double saturated them if frame is already saturated, though the frame might benefit too. Let's reset)
+  ctx.filter = 'none';
 
   // Draw frame FIRST (under text), stretched to fit the photo size
   if (frameImage.value) {
@@ -465,6 +474,10 @@ async function downloadAll() {
       </div>
 
       <div class="export-zone" v-if="photos.length">
+        <label class="upscale-box">
+          <input type="checkbox" v-model="upscaleExport"/>
+          <span>✨ <b>Upscale 2x & Làm nét</b> (Chống mờ FB)</span>
+        </label>
         <button class="dl-btn" @click="downloadSingle()" :disabled="isDownloading">{{ isDownloading ? 'Đang xử lý...' : '⬇ Tải ảnh đang xem' }}</button>
         <button v-if="photos.length>1" class="dl-btn all" @click="downloadAll" :disabled="isDownloading">{{ isDownloading ? 'Đang nén...' : `⬇ Tải tất cả (${photos.length}) [ZIP]` }}</button>
       </div>
@@ -597,6 +610,11 @@ body{margin:0;background:var(--bg);color:var(--txt);font-family:'Outfit',sans-se
 .crop-actions{display:flex;gap:6px}
 .crop-btn{flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;background:rgba(255,255,255,.06);color:#fff;cursor:pointer;font-family:inherit;font-size:12px;font-weight:600}
 .crop-btn.apply{background:var(--pri);border-color:var(--pri)}
+
+.upscale-box{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--txt);cursor:pointer;background:rgba(255,255,255,.03);padding:12px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.1);transition:all .2s;user-select:none}
+.upscale-box:hover{background:rgba(255,255,255,.08);border-color:var(--pri)}
+.upscale-box input{width:16px;height:16px;cursor:pointer;accent-color:var(--pri)}
+.upscale-box b{color:#e0c3fc}
 
 .export-zone{margin-top:auto;display:flex;flex-direction:column;gap:10px}
 .dl-btn{color:#fff;border:none;padding:14px;border-radius:10px;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;transition:all .3s;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15)}
