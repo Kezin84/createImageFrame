@@ -16,6 +16,21 @@ const frameImage = ref<HTMLImageElement | null>(null);
 const photos = ref<PhotoItem[]>([]);
 const activePhotoId = ref<string | null>(null);
 const activePhoto = computed(() => photos.value.find(p => p.id === activePhotoId.value));
+
+const canvasAspectRatio = computed(() => {
+  const photo = activePhoto.value;
+  if (photo?.imgElement) {
+    const crop = photo.crop || { x: 0, y: 0, w: 1, h: 1 };
+    const w = photo.imgElement.width * crop.w;
+    const h = photo.imgElement.height * crop.h;
+    if (photo.rotation === 90 || photo.rotation === 270) {
+      return `${h}/${w}`;
+    }
+    return `${w}/${h}`;
+  }
+  return frameImage.value ? `${frameImage.value.width}/${frameImage.value.height}` : '1/1';
+});
+
 const textItems = ref<TextItem[]>([]);
 const selectedTextId = ref<string | null>(null);
 const activeTool = ref<string | null>(null);
@@ -253,8 +268,14 @@ function redrawPreview() {
       const crop = photo.crop || { x: 0, y: 0, w: 1, h: 1 };
       const sx = crop.x * img.width, sy = crop.y * img.height, sw = crop.w * img.width, sh = crop.h * img.height;
       ctx.save();
-      if (photo.rotation) { ctx.translate(cw / 2, ch / 2); ctx.rotate((photo.rotation * Math.PI) / 180); ctx.translate(-cw / 2, -ch / 2); }
-      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, cw, ch);
+      ctx.translate(cw / 2, ch / 2);
+      if (photo.rotation) { ctx.rotate((photo.rotation * Math.PI) / 180); }
+      
+      let drawW = cw, drawH = ch;
+      if (photo.rotation === 90 || photo.rotation === 270) {
+        drawW = ch; drawH = cw;
+      }
+      ctx.drawImage(img, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
       ctx.restore();
     }
     // Draw frame
@@ -271,20 +292,43 @@ watch(container, (el) => { if (el) { resizeObs?.observe(el); redrawPreview(); } 
 
 // ---- EXPORT ----
 async function renderBlob(photo: PhotoItem): Promise<Blob | null> {
-  if (!frameImage.value || !photo.imgElement) return null;
-  const tw = frameImage.value.width, th = frameImage.value.height;
+  if (!photo.imgElement) return null;
+  const img = photo.imgElement;
+  const crop = photo.crop || { x: 0, y: 0, w: 1, h: 1 };
+  const sw = crop.w * img.width, sh = crop.h * img.height;
+  const sx = crop.x * img.width, sy = crop.y * img.height;
+  
+  let tw = sw, th = sh;
+  if (photo.rotation === 90 || photo.rotation === 270) {
+    tw = sh; th = sw;
+  }
+  
+  // Tùy chỉnh nếu không có ảnh sản phẩm nhưng lại có khung (cũng đã chặn trên)
+  if (!img && frameImage.value) {
+    tw = frameImage.value.width;
+    th = frameImage.value.height;
+  }
+
   const c = document.createElement('canvas'); c.width = tw; c.height = th;
   const ctx = c.getContext('2d'); if (!ctx) return null;
   ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
-  const img = photo.imgElement;
-  const crop = photo.crop || { x: 0, y: 0, w: 1, h: 1 };
-  const sx = crop.x * img.width, sy = crop.y * img.height, sw = crop.w * img.width, sh = crop.h * img.height;
+  
   ctx.save();
-  if (photo.rotation) { ctx.translate(tw / 2, th / 2); ctx.rotate((photo.rotation * Math.PI) / 180); ctx.translate(-tw / 2, -th / 2); }
-  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, tw, th);
+  ctx.translate(tw / 2, th / 2);
+  if (photo.rotation) { ctx.rotate((photo.rotation * Math.PI) / 180); }
+  
+  let drawW = tw, drawH = th;
+  if (photo.rotation === 90 || photo.rotation === 270) {
+    drawW = th; drawH = tw;
+  }
+  ctx.drawImage(img, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
   ctx.restore();
-  // Draw frame FIRST (under text)
-  ctx.drawImage(frameImage.value, 0, 0, tw, th);
+
+  // Draw frame FIRST (under text), stretched to fit the photo size
+  if (frameImage.value) {
+    ctx.drawImage(frameImage.value, 0, 0, tw, th);
+  }
+  
   // Then draw texts ON TOP of frame
   const scale = tw / (container.value?.clientWidth || tw);
   for (const t of textItems.value) {
@@ -300,7 +344,6 @@ async function renderBlob(photo: PhotoItem): Promise<Blob | null> {
 }
 async function downloadSingle(p?: PhotoItem) {
   const photo = p || activePhoto.value; if (!photo) return;
-  if (!frameImage.value) { alert('Tải khung ảnh trước!'); return; }
   isDownloading.value = true;
   try {
     const blob = await renderBlob(photo); if (!blob) return;
@@ -309,7 +352,7 @@ async function downloadSingle(p?: PhotoItem) {
   } finally { isDownloading.value = false; }
 }
 async function downloadAll() {
-  if (!photos.value.length || !frameImage.value) { alert('Cần có khung và ảnh!'); return; }
+  if (!photos.value.length) { alert('Cần có ít nhất 1 ảnh!'); return; }
   isDownloading.value = true;
   try {
     const zip = new JSZip(); const folder = zip.folder('MixPhoto-Export')!;
@@ -437,7 +480,7 @@ async function downloadAll() {
 
         <!-- NORMAL PREVIEW -->
         <div v-else-if="frameSrc || activePhoto" class="canvas-container" ref="container"
-          :style="{aspectRatio: frameImage ? frameImage.width+'/'+frameImage.height : '1/1'}"
+          :style="{aspectRatio: canvasAspectRatio}"
           @mousedown="deselectText">
           <canvas ref="previewCanvas" class="preview-canvas"></canvas>
           <!-- Canva-style text boxes -->
