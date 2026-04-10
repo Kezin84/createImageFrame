@@ -17,19 +17,41 @@ const photos = ref<PhotoItem[]>([]);
 const activePhotoId = ref<string | null>(null);
 const activePhoto = computed(() => photos.value.find(p => p.id === activePhotoId.value));
 
-const canvasAspectRatio = computed(() => {
+const fbTargetSize = computed(() => {
   const photo = activePhoto.value;
-  if (photo?.imgElement) {
-    const crop = photo.crop || { x: 0, y: 0, w: 1, h: 1 };
-    const w = photo.imgElement.width * crop.w;
-    const h = photo.imgElement.height * crop.h;
-    if (photo.rotation === 90 || photo.rotation === 270) {
-      return `${h}/${w}`;
-    }
-    return `${w}/${h}`;
+  if (!photo?.imgElement) return null;
+  const crop = photo.crop || { x: 0, y: 0, w: 1, h: 1 };
+  const w = photo.imgElement.width * crop.w;
+  const h = photo.imgElement.height * crop.h;
+  const isRotated = photo.rotation === 90 || photo.rotation === 270;
+  const finalW = isRotated ? h : w;
+  const finalH = isRotated ? w : h;
+  const ratio = finalW / finalH;
+  if (ratio > 1.05) return { w: 1200, h: 630 }; // FB Landscape
+  if (ratio < 0.95) return { w: 1080, h: 1350 }; // FB Portrait
+  return { w: 1080, h: 1080 }; // FB Square
+});
+
+const canvasAspectRatio = computed(() => {
+  if (fbTargetSize.value) {
+    return `${fbTargetSize.value.w}/${fbTargetSize.value.h}`;
   }
   return frameImage.value ? `${frameImage.value.width}/${frameImage.value.height}` : '1/1';
 });
+
+function drawImageCover(ctx: CanvasRenderingContext2D, img: HTMLImageElement, sx: number, sy: number, sw: number, sh: number, dx: number, dy: number, dw: number, dh: number) {
+  const rSrc = sw / sh;
+  const rDst = dw / dh;
+  let finalSx = sx, finalSy = sy, finalSw = sw, finalSh = sh;
+  if (rSrc > rDst) {
+    finalSw = sh * rDst;
+    finalSx = sx + (sw - finalSw) / 2;
+  } else {
+    finalSh = sw / rDst;
+    finalSy = sy + (sh - finalSh) / 2;
+  }
+  ctx.drawImage(img, finalSx, finalSy, finalSw, finalSh, dx, dy, dw, dh);
+}
 
 const textItems = ref<TextItem[]>([]);
 const selectedTextId = ref<string | null>(null);
@@ -275,7 +297,7 @@ function redrawPreview() {
       if (photo.rotation === 90 || photo.rotation === 270) {
         drawW = ch; drawH = cw;
       }
-      ctx.drawImage(img, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
+      drawImageCover(ctx, img, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
       ctx.restore();
     }
     // Draw frame
@@ -298,10 +320,14 @@ async function renderBlob(photo: PhotoItem): Promise<Blob | null> {
   const sw = crop.w * img.width, sh = crop.h * img.height;
   const sx = crop.x * img.width, sy = crop.y * img.height;
   
-  let tw = sw, th = sh;
-  if (photo.rotation === 90 || photo.rotation === 270) {
-    tw = sh; th = sw;
-  }
+  const isRotated = photo.rotation === 90 || photo.rotation === 270;
+  const objW = isRotated ? sh : sw;
+  const objH = isRotated ? sw : sh;
+  const ratio = objW / objH;
+  
+  let tw = 1080, th = 1080;
+  if (ratio > 1.05) { tw = 1200; th = 630; }
+  else if (ratio < 0.95) { tw = 1080; th = 1350; }
   
   // Tùy chỉnh nếu không có ảnh sản phẩm nhưng lại có khung (cũng đã chặn trên)
   if (!img && frameImage.value) {
@@ -321,7 +347,7 @@ async function renderBlob(photo: PhotoItem): Promise<Blob | null> {
   if (photo.rotation === 90 || photo.rotation === 270) {
     drawW = th; drawH = tw;
   }
-  ctx.drawImage(img, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
+  drawImageCover(ctx, img, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
   ctx.restore();
 
   // Draw frame FIRST (under text), stretched to fit the photo size
@@ -386,6 +412,7 @@ async function downloadAll() {
           Tải ảnh chụp của bạn
           <input type="file" accept="image/*" multiple @change="onPhotoUpload"/>
         </label>
+        <p class="hint">Tự căn chuẩn kích thước FB cực nét (Dọc 1080x1350, Ngang 1200x630, Vuông 1080x1080).</p>
       </div>
 
       <!-- TEXT TOOL PANEL -->
