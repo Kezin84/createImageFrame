@@ -5,6 +5,7 @@ import JSZip from 'jszip';
 interface PhotoItem {
   id: string; src: string; imgElement?: HTMLImageElement; name: string;
   rotation: number; crop: { x: number; y: number; w: number; h: number } | null;
+  isAI?: boolean;
 }
 interface TextItem {
   id: string; content: string; x: number; y: number;
@@ -17,7 +18,7 @@ const photos = ref<PhotoItem[]>([]);
 const activePhotoId = ref<string | null>(null);
 const activePhoto = computed(() => photos.value.find(p => p.id === activePhotoId.value));
 
-const fbTargetSize = computed(() => {
+const targetSize = computed(() => {
   const photo = activePhoto.value;
   if (!photo?.imgElement) return null;
   const crop = photo.crop || { x: 0, y: 0, w: 1, h: 1 };
@@ -26,6 +27,13 @@ const fbTargetSize = computed(() => {
   const isRotated = photo.rotation === 90 || photo.rotation === 270;
   const finalW = isRotated ? h : w;
   const finalH = isRotated ? w : h;
+
+  // Ảnh AI: giữ nguyên kích thước gốc
+  if (photo.isAI) {
+    return { w: Math.round(finalW), h: Math.round(finalH) };
+  }
+
+  // Ảnh thường: chuẩn FB
   const ratio = finalW / finalH;
   if (ratio > 1.05) return { w: 1200, h: 630 }; // FB Landscape
   if (ratio < 0.95) return { w: 1080, h: 1350 }; // FB Portrait
@@ -33,13 +41,13 @@ const fbTargetSize = computed(() => {
 });
 
 const canvasAspectRatio = computed(() => {
-  if (fbTargetSize.value) {
-    return `${fbTargetSize.value.w}/${fbTargetSize.value.h}`;
+  if (targetSize.value) {
+    return `${targetSize.value.w}/${targetSize.value.h}`;
   }
   return frameImage.value ? `${frameImage.value.width}/${frameImage.value.height}` : '1/1';
 });
 
-function drawImageCover(ctx: CanvasRenderingContext2D, img: HTMLImageElement, sx: number, sy: number, sw: number, sh: number, dx: number, dy: number, dw: number, dh: number) {
+function drawImageCover(ctx: CanvasRenderingContext2D, img: CanvasImageSource, sx: number, sy: number, sw: number, sh: number, dx: number, dy: number, dw: number, dh: number) {
   const rSrc = sw / sh;
   const rDst = dw / dh;
   let finalSx = sx, finalSy = sy, finalSw = sw, finalSh = sh;
@@ -57,7 +65,10 @@ const textItems = ref<TextItem[]>([]);
 const selectedTextId = ref<string | null>(null);
 const activeTool = ref<string | null>(null);
 const isDownloading = ref(false);
-const upscaleExport = ref(true);
+const upscaleLevel = ref(3); // 1x, 2x, 3x, 4x
+const removeWatermark = ref(false);
+
+watch(removeWatermark, redrawPreview);
 
 const container = ref<HTMLElement | null>(null);
 const previewCanvas = ref<HTMLCanvasElement | null>(null);
@@ -78,14 +89,14 @@ function onFrameUpload(e: Event) {
   img.onload = () => { frameImage.value = img; nextTick(redrawPreview); };
   img.src = url;
 }
-function onPhotoUpload(e: Event) {
+function onPhotoUpload(e: Event, isAI = false) {
   const files = (e.target as HTMLInputElement).files;
   if (!files) return;
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
     const url = URL.createObjectURL(file);
     const id = Date.now().toString() + '-' + i;
-    const item: PhotoItem = { id, src: url, name: file.name.replace(/\.[^/.]+$/, ''), rotation: 0, crop: null };
+    const item: PhotoItem = { id, src: url, name: file.name.replace(/\.[^/.]+$/, ''), rotation: 0, crop: null, isAI };
     const img = new Image();
     img.onload = () => { item.imgElement = img; if (activePhotoId.value === id) nextTick(redrawPreview); };
     img.src = url;
@@ -269,6 +280,95 @@ function onTextResizeEnd() {
   window.removeEventListener('touchmove', onTextResizeMove); window.removeEventListener('touchend', onTextResizeEnd);
 }
 
+function getProcessedPhoto(img: HTMLImageElement): CanvasImageSource {
+  if (!removeWatermark.value) return img;
+  const tc = document.createElement('canvas');
+  tc.width = img.width; tc.height = img.height;
+  const tctx = tc.getContext('2d');
+  if (!tctx) return img;
+  
+  tctx.drawImage(img, 0, 0);
+  
+  // Vùng watermark: góc phải dưới, thêm padding để chắc chắn xóa sạch
+  const pad = 6;
+  const rw = Math.max(140, Math.round(tc.width * 0.14)) + pad;
+  const rh = Math.max(50, Math.round(tc.height * 0.07)) + pad;
+  const rx = tc.width - rw;
+  const ry = tc.height - rh;
+  
+  // Lấy pixel data toàn bộ vùng cần xử lý + vùng mẫu phía trên & bên trái
+  const samplePad = Math.max(rw, rh); // vùng mẫu lớn
+  const fetchX = Math.max(0, rx - samplePad);
+  const fetchY = Math.max(0, ry - samplePad);
+  const fetchW = Math.min(tc.width - fetchX, rw + samplePad);
+  const fetchH = Math.min(tc.height - fetchY, rh + samplePad);
+  
+  const imgData = tctx.getImageData(fetchX, fetchY, fetchW, fetchH);
+  const data = imgData.data;
+  const stride = fetchW * 4;
+  
+  // Offset của vùng watermark trong imgData
+  const offX = rx - fetchX;
+  const offY = ry - fetchY;
+  
+  // Inpaint: thay mỗi pixel trong vùng watermark bằng pixel mẫu
+  for (let y = 0; y < rh; y++) {
+    for (let x = 0; x < rw; x++) {
+      const dstIdx = ((offY + y) * fetchW + (offX + x)) * 4;
+      
+      // Lấy mẫu từ phía trên (mirror y vào vùng sạch)
+      const srcAboveY = offY - 1 - y;
+      // Lấy mẫu từ bên trái (mirror x vào vùng sạch)
+      const srcLeftX = offX - 1 - x;
+      
+      let rr = 0, gg = 0, bb = 0, aa = 0, count = 0;
+      
+      // Mẫu từ phía trên (ưu tiên cao)
+      if (srcAboveY >= 0) {
+        const srcIdx = (srcAboveY * fetchW + (offX + x)) * 4;
+        rr += data[srcIdx] * 2; gg += data[srcIdx+1] * 2; bb += data[srcIdx+2] * 2; aa += data[srcIdx+3] * 2;
+        count += 2;
+      }
+      
+      // Mẫu từ bên trái
+      if (srcLeftX >= 0) {
+        const srcIdx = ((offY + y) * fetchW + srcLeftX) * 4;
+        rr += data[srcIdx]; gg += data[srcIdx+1]; bb += data[srcIdx+2]; aa += data[srcIdx+3];
+        count += 1;
+      }
+      
+      // Mẫu chéo (trên-trái)
+      if (srcAboveY >= 0 && srcLeftX >= 0) {
+        const srcIdx = (srcAboveY * fetchW + srcLeftX) * 4;
+        rr += data[srcIdx]; gg += data[srcIdx+1]; bb += data[srcIdx+2]; aa += data[srcIdx+3];
+        count += 1;
+      }
+      
+      if (count > 0) {
+        // Blend mượt: pixel gần viền giữ nhiều gốc, pixel sâu bên trong thay hoàn toàn
+        const blendX = Math.min(x / (pad * 2), 1);
+        const blendY = Math.min(y / (pad * 2), 1);
+        const blend = Math.min(blendX, blendY); // 0 = giữ gốc, 1 = thay hoàn toàn
+        
+        const nr = rr / count;
+        const ng = gg / count;
+        const nb = bb / count;
+        const na = aa / count;
+        
+        data[dstIdx]   = Math.round(data[dstIdx]   * (1 - blend) + nr * blend);
+        data[dstIdx+1] = Math.round(data[dstIdx+1] * (1 - blend) + ng * blend);
+        data[dstIdx+2] = Math.round(data[dstIdx+2] * (1 - blend) + nb * blend);
+        data[dstIdx+3] = Math.round(data[dstIdx+3] * (1 - blend) + na * blend);
+      }
+    }
+  }
+  
+  // Ghi pixel đã xử lý lại canvas
+  tctx.putImageData(imgData, fetchX, fetchY);
+  
+  return tc;
+}
+
 // ---- PREVIEW CANVAS ----
 function redrawPreview() {
   nextTick(() => {
@@ -288,6 +388,7 @@ function redrawPreview() {
     const photo = activePhoto.value;
     if (photo?.imgElement) {
       const img = photo.imgElement;
+      const imgSource = getProcessedPhoto(img);
       const crop = photo.crop || { x: 0, y: 0, w: 1, h: 1 };
       const sx = crop.x * img.width, sy = crop.y * img.height, sw = crop.w * img.width, sh = crop.h * img.height;
       ctx.save();
@@ -298,7 +399,7 @@ function redrawPreview() {
       if (photo.rotation === 90 || photo.rotation === 270) {
         drawW = ch; drawH = cw;
       }
-      drawImageCover(ctx, img, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
+      drawImageCover(ctx, imgSource, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
       ctx.restore();
     }
     // Draw frame
@@ -317,6 +418,7 @@ watch(container, (el) => { if (el) { resizeObs?.observe(el); redrawPreview(); } 
 async function renderBlob(photo: PhotoItem): Promise<Blob | null> {
   if (!photo.imgElement) return null;
   const img = photo.imgElement;
+  const imgSource = getProcessedPhoto(img);
   const crop = photo.crop || { x: 0, y: 0, w: 1, h: 1 };
   const sw = crop.w * img.width, sh = crop.h * img.height;
   const sx = crop.x * img.width, sy = crop.y * img.height;
@@ -326,23 +428,41 @@ async function renderBlob(photo: PhotoItem): Promise<Blob | null> {
   const objH = isRotated ? sw : sh;
   const ratio = objW / objH;
   
-  const scaleExport = upscaleExport.value ? 2 : 1;
-  let tw = 1080 * scaleExport, th = 1080 * scaleExport;
-  if (ratio > 1.05) { tw = 1200 * scaleExport; th = 630 * scaleExport; }
-  else if (ratio < 0.95) { tw = 1080 * scaleExport; th = 1350 * scaleExport; }
+  const scale = upscaleLevel.value;
+  let tw: number, th: number;
+
+  if (photo.isAI) {
+    // Ảnh AI: giữ nguyên kích thước gốc × scale
+    tw = Math.round(objW) * scale;
+    th = Math.round(objH) * scale;
+  } else {
+    // Ảnh thường: chuẩn FB × scale
+    tw = 1080 * scale; th = 1080 * scale;
+    if (ratio > 1.05) { tw = 1200 * scale; th = 630 * scale; }
+    else if (ratio < 0.95) { tw = 1080 * scale; th = 1350 * scale; }
+  }
   
-  // Tùy chỉnh nếu không có ảnh sản phẩm nhưng lại có khung (cũng đã chặn trên)
+  // Đảm bảo kích thước xuất không nhỏ hơn pixel gốc (tránh bể ảnh khi crop)
+  const minW = Math.round(objW);
+  const minH = Math.round(objH);
+  if (tw < minW || th < minH) {
+    const upRatio = Math.max(minW / tw, minH / th);
+    tw = Math.round(tw * upRatio);
+    th = Math.round(th * upRatio);
+  }
+  
+  // Tùy chỉnh nếu không có ảnh sản phẩm nhưng lại có khung
   if (!img && frameImage.value) {
-    tw = frameImage.value.width * scaleExport;
-    th = frameImage.value.height * scaleExport;
+    tw = frameImage.value.width * scale;
+    th = frameImage.value.height * scale;
   }
 
   const c = document.createElement('canvas'); c.width = tw; c.height = th;
   const ctx = c.getContext('2d'); if (!ctx) return null;
   ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
   
-  if (upscaleExport.value) {
-    ctx.filter = 'contrast(102%) saturate(105%)'; // Làm nét và nổi bật màu sắc nhẹ
+  if (scale > 1) {
+    ctx.filter = 'contrast(101%) saturate(103%)'; // Tăng nhẹ chất lượng
   }
   
   ctx.save();
@@ -353,7 +473,7 @@ async function renderBlob(photo: PhotoItem): Promise<Blob | null> {
   if (photo.rotation === 90 || photo.rotation === 270) {
     drawW = th; drawH = tw;
   }
-  drawImageCover(ctx, img, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
+  drawImageCover(ctx, imgSource, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
   ctx.restore();
 
   // Reset filter for frame and texts (so we don't double saturated them if frame is already saturated, though the frame might benefit too. Let's reset)
@@ -365,13 +485,13 @@ async function renderBlob(photo: PhotoItem): Promise<Blob | null> {
   }
   
   // Then draw texts ON TOP of frame
-  const scale = tw / (container.value?.clientWidth || tw);
+  const textScale = tw / (container.value?.clientWidth || tw);
   for (const t of textItems.value) {
     ctx.save();
     let font = ''; if (t.italic) font += 'italic '; if (t.bold) font += 'bold ';
-    font += `${Math.round(t.fontSize * scale)}px ${t.fontFamily}`;
+    font += `${Math.round(t.fontSize * textScale)}px ${t.fontFamily}`;
     ctx.font = font; ctx.fillStyle = t.color; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.shadowColor = 'rgba(0,0,0,0.7)'; ctx.shadowBlur = 6 * scale;
+    ctx.shadowColor = 'rgba(0,0,0,0.7)'; ctx.shadowBlur = 6 * textScale;
     ctx.fillText(t.content, (t.x / 100) * tw, (t.y / 100) * th);
     ctx.restore();
   }
@@ -419,9 +539,19 @@ async function downloadAll() {
         <label class="upload-btn">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
           Tải ảnh chụp của bạn
-          <input type="file" accept="image/*" multiple @change="onPhotoUpload"/>
+          <input type="file" accept="image/*" multiple @change="onPhotoUpload($event, false)"/>
         </label>
         <p class="hint">Tự căn chuẩn kích thước FB cực nét (Dọc 1080x1350, Ngang 1200x630, Vuông 1080x1080).</p>
+      </div>
+
+      <div class="step-card ai-card">
+        <div class="step-title"><span class="sn ai">AI</span> Tải ảnh AI (giữ kích thước gốc)</div>
+        <label class="upload-btn ub-ai">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+          Tải ảnh từ Gemini / AI
+          <input type="file" accept="image/*" multiple @change="onPhotoUpload($event, true)"/>
+        </label>
+        <p class="hint">Không giới hạn kích thước — xuất đúng kích thước gốc của ảnh. Hỗ trợ xóa watermark AI.</p>
       </div>
 
       <!-- TEXT TOOL PANEL -->
@@ -475,9 +605,19 @@ async function downloadAll() {
 
       <div class="export-zone" v-if="photos.length">
         <label class="upscale-box">
-          <input type="checkbox" v-model="upscaleExport"/>
-          <span>✨ <b>Upscale 2x & Làm nét</b> (Chống mờ FB)</span>
+          <input type="checkbox" v-model="removeWatermark"/>
+          <span>🚫 <b>Xóa Watermark AI</b> (Góc phải dưới)</span>
         </label>
+        <div class="upscale-box">
+          <span>✨ <b>Upscale</b></span>
+          <select class="ti upscale-select" v-model.number="upscaleLevel">
+            <option :value="1">1x (Gốc)</option>
+            <option :value="2">2x</option>
+            <option :value="3">3x (Khuyến nghị)</option>
+            <option :value="4">4x (Maximum)</option>
+          </select>
+          <span class="upscale-info">Chống bể ảnh khi crop</span>
+        </div>
         <button class="dl-btn" @click="downloadSingle()" :disabled="isDownloading">{{ isDownloading ? 'Đang xử lý...' : '⬇ Tải ảnh đang xem' }}</button>
         <button v-if="photos.length>1" class="dl-btn all" @click="downloadAll" :disabled="isDownloading">{{ isDownloading ? 'Đang nén...' : `⬇ Tải tất cả (${photos.length}) [ZIP]` }}</button>
       </div>
@@ -561,6 +701,7 @@ async function downloadAll() {
         <div class="reel-track">
           <div v-for="p in photos" :key="p.id" class="thumb" :class="{active:activePhotoId===p.id}" @click="activePhotoId=p.id">
             <img :src="p.src"/>
+            <span v-if="p.isAI" class="thumb-ai-badge">AI</span>
             <div class="thumb-hover">
               <button class="ib rm" @click.stop="removePhoto(p.id)" title="Xóa">✕</button>
               <button class="ib dl" @click.stop="downloadSingle(p)" title="Tải">⬇</button>
@@ -586,6 +727,10 @@ body{margin:0;background:var(--bg);color:var(--txt);font-family:'Outfit',sans-se
 .upload-btn{display:flex;align-items:center;justify-content:center;gap:8px;padding:12px;background:rgba(255,255,255,.05);border:1px dashed rgba(255,255,255,.2);border-radius:8px;cursor:pointer;transition:all .3s;font-size:13px;font-weight:500;position:relative;color:var(--txt)}
 .upload-btn:hover{background:rgba(255,255,255,.1);transform:translateY(-2px)}
 .ub-primary{border-color:var(--pri);color:#e0c3fc;background:rgba(138,43,226,.08)}
+.ai-card{border-color:rgba(0,200,200,.25);background:rgba(0,200,200,.03)}
+.sn.ai{background:linear-gradient(135deg,#00c9c9,#0ea5e9);font-size:9px;width:24px;border-radius:6px}
+.ub-ai{border-color:rgba(0,200,200,.4);color:#7df3f3;background:rgba(0,200,200,.08)}
+.ub-ai:hover{background:rgba(0,200,200,.15)}
 .upload-btn input{position:absolute;top:0;left:0;opacity:0;width:100%;height:100%;cursor:pointer}
 
 .tool-panel{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:10px}
@@ -611,10 +756,12 @@ body{margin:0;background:var(--bg);color:var(--txt);font-family:'Outfit',sans-se
 .crop-btn{flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;background:rgba(255,255,255,.06);color:#fff;cursor:pointer;font-family:inherit;font-size:12px;font-weight:600}
 .crop-btn.apply{background:var(--pri);border-color:var(--pri)}
 
-.upscale-box{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--txt);cursor:pointer;background:rgba(255,255,255,.03);padding:12px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.1);transition:all .2s;user-select:none}
+.upscale-box{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--txt);background:rgba(255,255,255,.03);padding:12px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.1);transition:all .2s;user-select:none;flex-wrap:wrap}
 .upscale-box:hover{background:rgba(255,255,255,.08);border-color:var(--pri)}
 .upscale-box input{width:16px;height:16px;cursor:pointer;accent-color:var(--pri)}
 .upscale-box b{color:#e0c3fc}
+.upscale-select{width:auto!important;flex:1;min-width:100px;padding:6px 8px!important;font-size:12px!important}
+.upscale-info{font-size:11px;color:var(--muted);width:100%}
 
 .export-zone{margin-top:auto;display:flex;flex-direction:column;gap:10px}
 .dl-btn{color:#fff;border:none;padding:14px;border-radius:10px;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;transition:all .3s;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15)}
@@ -681,6 +828,7 @@ body{margin:0;background:var(--bg);color:var(--txt);font-family:'Outfit',sans-se
 .ib{background:rgba(255,255,255,.2);border:none;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;color:#fff;cursor:pointer;font-size:12px;transition:all .2s}
 .ib.rm:hover{background:#ef4444}
 .ib.dl:hover{background:var(--pri)}
+.thumb-ai-badge{position:absolute;top:2px;left:2px;background:linear-gradient(135deg,#00c9c9,#0ea5e9);color:#fff;font-size:8px;font-weight:700;padding:1px 4px;border-radius:3px;z-index:5;letter-spacing:.5px}
 
 @media(max-width:900px){.app-layout{grid-template-columns:1fr;grid-template-rows:auto 70vh;height:auto}}
 </style>
